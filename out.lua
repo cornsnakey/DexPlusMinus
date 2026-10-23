@@ -107,6 +107,140 @@ return Util
 
 end)()
 
+local DexFeatures = (function()
+-- Session navigation and client-side tool conversion, shared by UI and tests.
+local Features = {}
+
+function Features.newNavigation(limit)
+	local state = {Favorites = {}, FavoriteMap = {}, History = {}, Cursor = 0, Limit = limit or 100}
+	function state:AddFavorite(obj)
+		if not obj or self.FavoriteMap[obj] then return false end
+		self.FavoriteMap[obj] = true
+		table.insert(self.Favorites, obj)
+		return true
+	end
+	function state:RemoveFavorite(obj)
+		if not self.FavoriteMap[obj] then return false end
+		self.FavoriteMap[obj] = nil
+		for i, item in ipairs(self.Favorites) do
+			if item == obj then table.remove(self.Favorites, i) break end
+		end
+		return true
+	end
+	function state:ClearFavorites()
+		table.clear(self.Favorites)
+		table.clear(self.FavoriteMap)
+	end
+	function state:ClearHistory()
+		table.clear(self.History)
+		self.Cursor = 0
+	end
+	function state:Record(objects)
+		if #objects == 0 then return end
+		local previous = self.History[self.Cursor]
+		local same = previous and #previous == #objects
+		if same then
+			for i, obj in ipairs(objects) do if previous[i] ~= obj then same = false break end end
+		end
+		if same then return end
+		while #self.History > self.Cursor do table.remove(self.History) end
+		local snapshot = {}
+		for i, obj in ipairs(objects) do snapshot[i] = obj end
+		table.insert(self.History, snapshot)
+		while #self.History > self.Limit do table.remove(self.History, 1) end
+		self.Cursor = #self.History
+	end
+	function state:Visit(index, available)
+		local entry = self.History[index]
+		if not entry then return nil end
+		local result = {}
+		for _, obj in ipairs(entry) do
+			if available(obj) then table.insert(result, obj) end
+		end
+		if #result == 0 then return nil end
+		self.Cursor = index
+		return result
+	end
+	function state:Step(direction, available)
+		local index = self.Cursor + direction
+		while index >= 1 and index <= #self.History do
+			local objects = self:Visit(index, available)
+			if objects then return objects end
+			index = index + direction
+		end
+		return nil
+	end
+	return state
+end
+
+function Features.canConvert(source)
+	return source and not source:IsA("Terrain") and not source:IsA("Workspace")
+		and (source:IsA("BasePart") or source:IsA("Model"))
+end
+
+function Features.createLocalTool(source, backpack, newInstance)
+	if not Features.canConvert(source) then return nil, "Select a Part or Model." end
+	if not backpack then return nil, "Your Backpack is not available yet." end
+	newInstance = newInstance or Instance.new
+	local tool, clone
+	local success, result = pcall(function()
+		clone = source:Clone()
+		if not clone then error("Object cannot be cloned. Its Archivable property may be off.", 0) end
+		local parts, contents = {}, clone:GetDescendants()
+		if clone:IsA("BasePart") then table.insert(parts, clone) end
+		for _, item in ipairs(contents) do
+			if item:IsA("BasePart") then table.insert(parts, item) end
+		end
+		if #parts == 0 then error("The model contains no parts to hold.", 0) end
+		-- Remove executable behavior and old physics links from the unparented copy.
+		for _, item in ipairs(contents) do
+			if item:IsA("LuaSourceContainer") or item:IsA("Humanoid") or item:IsA("AnimationController")
+				or item:IsA("Constraint") or item:IsA("JointInstance")
+				or item:IsA("WeldConstraint") or item:IsA("NoCollisionConstraint") then item:Destroy() end
+		end
+		local handle = clone:IsA("Model") and clone.PrimaryPart or nil
+		if not handle then
+			for _, part in ipairs(parts) do if part.Name == "Handle" then handle = part break end end
+		end
+		handle = handle or parts[1]
+		tool = newInstance("Tool")
+		tool.Name = source.Name
+		tool.ToolTip = "Local copy made by dex+-"
+		tool.RequiresHandle = true
+		tool.CanBeDropped = false
+		-- A model itself named Handle must not shadow the actual grip part.
+		if clone:IsA("Model") then clone.Name = "Contents" end
+		clone.Parent = tool
+		handle.Name = "Handle"
+		handle.Parent = tool
+		for _, part in ipairs(parts) do
+			part.Anchored = false
+			part.CanCollide = false
+			part.CanTouch = false
+			part.Massless = true
+			if part ~= handle then
+				local weld = newInstance("WeldConstraint")
+				weld.Part0 = handle
+				weld.Part1 = part
+				weld.Parent = part
+			end
+		end
+		-- Only publish after conversion is complete; the original is never modified.
+		tool.Parent = backpack
+		return tool
+	end)
+	if not success then
+		if tool then tool:Destroy() end
+		if clone then clone:Destroy() end
+		return nil, tostring(result)
+	end
+	return result
+end
+
+return Features
+
+end)()
+
 local EmbeddedModules = {
 ["Console"] = function()
 --[[
@@ -1820,6 +1954,10 @@ local function main()
 		context:AddRegistered("DELETE")
 		context:AddRegistered("DELETE_CHILDREN", #sList ~= 1)
 		context:AddRegistered("RENAME", #sList ~= 1)
+		if Apps.Extras and Apps.Extras.AddContextItems then
+			context:AddDivider()
+			Apps.Extras.AddContextItems(context)
+		end
 
 		context:AddDivider()
 		context:AddRegistered("GROUP")
@@ -3509,6 +3647,272 @@ return search]==]
 	end
 
 	return Explorer
+end
+
+return {InitDeps = initDeps, InitAfterMain = initAfterMain, Main = main}
+
+end,
+["Extras"] = function()
+-- dex+- favorites, selection history and local tool creation.
+local deps
+local function initDeps(data) deps = data end
+local function initAfterMain() end
+
+local function main()
+	local Extras = {}
+	local state = deps.Features.newNavigation(100)
+	Extras.State = state
+	local Explorer, window, list, status, back, forward, favorite, tabs, clear
+	local activeTab, navigating, busy = "Favorites", false, false
+	local theme = deps.Settings.Theme
+
+	local function getNode(obj)
+		local node = nodes[obj]
+		return node and not node.Del and not node.Locked and node or nil
+	end
+	local function selectedObjects()
+		local result = {}
+		for _, node in ipairs(Explorer.Selection.List) do
+			if getNode(node.Obj) then result[#result + 1] = node.Obj end
+		end
+		return result
+	end
+	local function report(message, failure)
+		status.Text = message
+		if failure then window:Show() end
+	end
+	local function allFavorited(objects)
+		if #objects == 0 then return false end
+		for _, obj in ipairs(objects) do if not state.FavoriteMap[obj] then return false end end
+		return true
+	end
+	local function nameOf(obj)
+		local success, name = pcall(function() return obj.Name end)
+		return success and name or "Unavailable object"
+	end
+	local function pathOf(obj)
+		if not getNode(obj) then return "Unavailable in Explorer" end
+		local success, path = pcall(function() return obj:GetFullName() end)
+		return success and path or nameOf(obj)
+	end
+	local function button(parent, text, position, size, callback)
+		local item = Instance.new("TextButton")
+		item.Name = text
+		item.Text = text
+		item.RichText = false
+		item.Font = Enum.Font.SourceSans
+		item.TextSize = 14
+		item.TextColor3 = theme.Text
+		item.BackgroundColor3 = theme.Button
+		item.BorderColor3 = theme.Outline2
+		item.Position = position
+		item.Size = size
+		item.Parent = parent
+		item.Activated:Connect(callback)
+		return item
+	end
+	local function updateButtons()
+		back.TextColor3 = state.Cursor > 1 and theme.Text or theme.PlaceholderText
+		forward.TextColor3 = state.Cursor < #state.History and theme.Text or theme.PlaceholderText
+		favorite.Text = allFavorited(selectedObjects()) and "Unfavorite" or "Favorite"
+		for name, tab in pairs(tabs) do
+			tab.BackgroundColor3 = name == activeTab and theme.ListSelection or theme.Button
+		end
+		clear.Text = activeTab == "Favorites" and "Clear favorites" or "Clear history"
+	end
+
+	local function selectObjects(objects, fromHistory)
+		local selection = {}
+		for _, obj in ipairs(objects) do
+			local node = getNode(obj)
+			if node then table.insert(selection, node) end
+		end
+		if #selection == 0 then report("This object is no longer available.", true) return false end
+		Explorer.ClearSearch()
+		navigating = fromHistory or false
+		local success, message = pcall(Explorer.Selection.SetTable, Explorer.Selection, selection)
+		navigating = false
+		if not success then report(tostring(message), true) return false end
+		Explorer.ViewNode(selection[1])
+		Extras.Render()
+		return true
+	end
+
+	Extras.Render = function()
+		updateButtons()
+		if window.Closed then return end
+		for _, child in ipairs(list:GetChildren()) do
+			if child:IsA("GuiObject") then child:Destroy() end
+		end
+		local function row(objects, order, historyIndex)
+			local obj = objects[1]
+			local label = nameOf(obj)
+			if #objects > 1 then label = label.." (+"..(#objects - 1)..")" end
+			local container = Instance.new("Frame")
+			container.BackgroundTransparency = 1
+			container.Size = UDim2.new(1, -4, 0, 46)
+			container.LayoutOrder = order
+			container.Parent = list
+			local entry = button(container, "", UDim2.new(), UDim2.new(1, activeTab == "Favorites" and -66 or 0, 1, 0), function()
+				if historyIndex then
+					local targets = state:Visit(historyIndex, getNode)
+					if targets then selectObjects(targets, true) else report("These objects are no longer available.", true) end
+				else
+					selectObjects(objects, false)
+				end
+			end)
+			if historyIndex == state.Cursor and activeTab == "History" then entry.BackgroundColor3 = theme.ListSelection end
+			local title = Instance.new("TextLabel")
+			title.BackgroundTransparency = 1
+			title.Size = UDim2.new(1, -12, 0, 22)
+			title.Position = UDim2.new(0, 6, 0, 1)
+			title.TextXAlignment = Enum.TextXAlignment.Left
+			title.TextTruncate = Enum.TextTruncate.AtEnd
+			title.Font = Enum.Font.SourceSans
+			title.TextSize = 15
+			title.TextColor3 = theme.Text
+			title.Text = label
+			title.Parent = entry
+			local path = title:Clone()
+			path.Position = UDim2.new(0, 6, 0, 23)
+			path.TextSize = 12
+			path.TextColor3 = theme.PlaceholderText
+			path.Text = pathOf(obj)
+			path.Parent = entry
+			if activeTab == "Favorites" then
+				button(container, "Remove", UDim2.new(1, -62, 0, 0), UDim2.new(0, 62, 1, 0), function()
+					state:RemoveFavorite(obj)
+					Extras.Render()
+				end)
+			end
+		end
+		if activeTab == "Favorites" then
+			for i, obj in ipairs(state.Favorites) do row({obj}, i) end
+		else
+			for i = #state.History, 1, -1 do row(state.History[i], #state.History - i + 1, i) end
+		end
+		if (activeTab == "Favorites" and #state.Favorites == 0) or (activeTab == "History" and #state.History == 0) then
+			local empty = Instance.new("TextLabel")
+			empty.BackgroundTransparency = 1
+			empty.Size = UDim2.new(1, -4, 0, 58)
+			empty.Font = Enum.Font.SourceSans
+			empty.TextSize = 14
+			empty.TextColor3 = theme.PlaceholderText
+			empty.TextWrapped = true
+			empty.Text = activeTab == "Favorites" and "Select objects in Explorer, then press Favorite."
+				or "Objects you inspect will appear here."
+			empty.Parent = list
+		end
+	end
+
+	Extras.ToggleFavorites = function()
+		local objects = selectedObjects()
+		if #objects == 0 then report("Select an object in Explorer first.", true) return end
+		local remove = allFavorited(objects)
+		for _, obj in ipairs(objects) do
+			if remove then state:RemoveFavorite(obj) else state:AddFavorite(obj) end
+		end
+		Extras.Render()
+		report(remove and "Removed from favorites." or "Added to favorites.")
+	end
+	Extras.Navigate = function(direction)
+		local objects = state:Step(direction, getNode)
+		if objects then selectObjects(objects, true) else report("No available history in that direction.") end
+	end
+	Extras.Show = function(tab)
+		activeTab = tab or activeTab
+		window:Show()
+		Extras.Render()
+	end
+	Extras.CreateTools = function()
+		if busy then return end
+		busy = true
+		local count, failed, message = 0, 0, nil
+		local backpack = deps.plr:FindFirstChildOfClass("Backpack")
+		for _, obj in ipairs(selectedObjects()) do
+			if deps.Features.canConvert(obj) then
+				local tool, errorMessage = deps.Features.createLocalTool(obj, backpack)
+				if tool then count = count + 1 else failed = failed + 1 message = errorMessage end
+			end
+		end
+		busy = false
+		if count == 0 then
+			report(message or "Select a Part or Model containing parts.", true)
+		elseif failed > 0 then
+			report("Created "..count.." tool(s); "..failed.." failed: "..tostring(message), true)
+		else
+			report("Created "..count.." local tool(s) in your Backpack.")
+		end
+	end
+	Extras.AddContextItems = function(context)
+		local objects = selectedObjects()
+		local convertible = false
+		for _, obj in ipairs(objects) do if deps.Features.canConvert(obj) then convertible = true break end end
+		context:Add({Name = allFavorited(objects) and "Remove from Favorites" or "Add to Favorites", Disabled = #objects == 0, OnClick = Extras.ToggleFavorites})
+		context:Add({Name = "Favorites & History", OnClick = function() Extras.Show() end})
+		context:Add({Name = "History Back", Disabled = state.Cursor <= 1, OnClick = function() Extras.Navigate(-1) end})
+		context:Add({Name = "History Forward", Disabled = state.Cursor >= #state.History, OnClick = function() Extras.Navigate(1) end})
+		context:Add({Name = "Create Tool (Local)", Disabled = not convertible, OnClick = Extras.CreateTools})
+	end
+
+	Extras.Init = function()
+		Explorer = deps.Apps.Explorer
+		window = deps.Lib.Window.new()
+		window:SetTitle("Favorites & History")
+		window:Resize(440, 380)
+		Extras.Window = window
+		local content = window.GuiElems.Content
+		back = button(content, "Back", UDim2.new(0, 5, 0, 5), UDim2.new(0.18, -5, 0, 28), function() Extras.Navigate(-1) end)
+		forward = button(content, "Forward", UDim2.new(0.18, 2, 0, 5), UDim2.new(0.2, -5, 0, 28), function() Extras.Navigate(1) end)
+		favorite = button(content, "Favorite", UDim2.new(0.38, 0, 0, 5), UDim2.new(0.27, -4, 0, 28), Extras.ToggleFavorites)
+		button(content, "Create Tool", UDim2.new(0.65, 0, 0, 5), UDim2.new(0.35, -5, 0, 28), Extras.CreateTools)
+		tabs = {}
+		for i, tab in ipairs({"Favorites", "History"}) do
+			tabs[tab] = button(content, tab, UDim2.new((i - 1) * 0.5, 5, 0, 38), UDim2.new(0.5, -8, 0, 28), function()
+				activeTab = tab
+				list.CanvasPosition = Vector2.new()
+				Extras.Render()
+			end)
+		end
+		list = Instance.new("ScrollingFrame")
+		list.Name = "Entries"
+		list.BackgroundColor3 = theme.Main2
+		list.BorderColor3 = theme.Outline1
+		list.Position = UDim2.new(0, 5, 0, 72)
+		list.Size = UDim2.new(1, -10, 1, -112)
+		list.CanvasSize = UDim2.new()
+		list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+		list.ScrollBarThickness = 6
+		list.ScrollBarImageColor3 = theme.ButtonHover
+		list.Parent = content
+		local layout = Instance.new("UIListLayout")
+		layout.SortOrder = Enum.SortOrder.LayoutOrder
+		layout.Padding = UDim.new(0, 4)
+		layout.Parent = list
+		clear = button(content, "Clear favorites", UDim2.new(0, 5, 1, -34), UDim2.new(0, 105, 0, 28), function()
+			if activeTab == "Favorites" then state:ClearFavorites() else state:ClearHistory() end
+			Extras.Render()
+		end)
+		status = Instance.new("TextLabel")
+		status.BackgroundTransparency = 1
+		status.Position = UDim2.new(0, 118, 1, -36)
+		status.Size = UDim2.new(1, -123, 0, 32)
+		status.Font = Enum.Font.SourceSans
+		status.TextSize = 12
+		status.TextWrapped = true
+		status.TextColor3 = theme.Text
+		status.Text = "Favorites and history last for this session."
+		status.Parent = content
+		window.OnActivate:Connect(Extras.Render)
+		window.OnRestore:Connect(Extras.Render)
+		Explorer.Selection.Changed:Connect(function()
+			if not navigating then state:Record(selectedObjects()) end
+			Extras.Render()
+		end)
+		state:Record(selectedObjects())
+		updateButtons()
+	end
+	return Extras
 end
 
 return {InitDeps = initDeps, InitAfterMain = initAfterMain, Main = main}
@@ -14431,7 +14835,7 @@ end
 Main = (function()
 	local Main = {}
 
-	Main.ModuleList = {"Explorer","Properties","ScriptViewer","Console","SaveInstance","ModelViewer","SettingsWindow"}
+	Main.ModuleList = {"Explorer","Properties","ScriptViewer","Console","SaveInstance","ModelViewer","SettingsWindow","Extras"}
 	Main.Elevated = false
 	Main.AllowDraggableOnMobile = true
 	Main.MissingEnv = {}
@@ -14562,6 +14966,7 @@ Main = (function()
 	Main.GetInitDeps = function()
 		return {
 			Util = DexUtil,
+			Features = DexFeatures,
 			Main = Main,
 			Lib = Lib,
 			Apps = Apps,
@@ -15344,13 +15749,13 @@ Main = (function()
 			{2,"Frame",{Active=true,BackgroundColor3=Color3.new(0.20392157137394,0.20392157137394,0.20392157137394),BorderSizePixel=0,Name="Main",Parent={1},Position=UDim2.new(0.5,-175,0.5,-100),Size=UDim2.new(0,350,0,200),}},
 			{3,"Frame",{BackgroundColor3=Color3.new(0.17647059261799,0.17647059261799,0.17647059261799),BorderSizePixel=0,ClipsDescendants=true,Name="Holder",Parent={2},Size=UDim2.new(1,0,1,0),}},
 			{4,"UIGradient",{Parent={3},Rotation=30,Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,1,0),NumberSequenceKeypoint.new(1,1,0),}),}},
-			{5,"TextLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Font=4,Name="Title",Parent={3},Position=UDim2.new(0,-190,0,15),Size=UDim2.new(0,100,0,50),Text="Dex++",TextColor3=Color3.new(1,1,1),TextSize=50,TextTransparency=1,}},
+			{5,"TextLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Font=4,Name="Title",Parent={3},Position=UDim2.new(0,-190,0,15),Size=UDim2.new(0,100,0,50),Text="dex+-",TextColor3=Color3.new(1,1,1),TextSize=50,TextTransparency=1,}},
 			{6,"TextLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Font=3,Name="Desc",Parent={3},Position=UDim2.new(0,-230,0,60),Size=UDim2.new(0,180,0,25),Text="Ultimate Debugging Suite",TextColor3=Color3.new(1,1,1),TextSize=18,TextTransparency=1,}},
 			{7,"TextLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Font=3,Name="StatusText",Parent={3},Position=UDim2.new(0,20,0,110),Size=UDim2.new(0,180,0,25),Text="Fetching API",TextColor3=Color3.new(1,1,1),TextSize=14,TextTransparency=1,}},
 			{8,"Frame",{BackgroundColor3=Color3.new(0.20392157137394,0.20392157137394,0.20392157137394),BorderSizePixel=0,Name="ProgressBar",Parent={3},Position=UDim2.new(0,110,0,145),Size=UDim2.new(0,0,0,4),}},
 			{9,"Frame",{BackgroundColor3=Color3.new(0.2392156869173,0.56078433990479,0.86274510622025),BorderSizePixel=0,Name="Bar",Parent={8},Size=UDim2.new(0,0,1,0),}},
 			{10,"ImageLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Image="rbxassetid://2764171053",ImageColor3=Color3.new(0.17647059261799,0.17647059261799,0.17647059261799),Parent={8},ScaleType=1,Size=UDim2.new(1,0,1,0),SliceCenter=Rect.new(2,2,254,254),}},
-			{11,"TextLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Font=3,Name="Creator",Parent={2},Position=UDim2.new(1,-110,1,-20),Size=UDim2.new(0,105,0,20),Text="Developed by Chillz.",TextColor3=Color3.new(1,1,1),TextSize=14,TextXAlignment=1,}},
+			{11,"TextLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Font=3,Name="Creator",Parent={2},Position=UDim2.new(1,-185,1,-20),Size=UDim2.new(0,180,0,20),Text="a dude who likes dex",TextColor3=Color3.new(1,1,1),TextSize=14,TextXAlignment=1,}},
 			{12,"UIGradient",{Parent={11},Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,1,0),NumberSequenceKeypoint.new(1,1,0),}),}},
 			{13,"TextLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Font=3,Name="Version",Parent={2},Position=UDim2.new(1,-110,1,-35),Size=UDim2.new(0,105,0,20),Text=Main.Version,TextColor3=Color3.new(1,1,1),TextSize=14,TextXAlignment=1,}},
 			{14,"UIGradient",{Parent={13},Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,1,0),NumberSequenceKeypoint.new(1,1,0),}),}},
@@ -15581,7 +15986,7 @@ Main = (function()
 	Main.SetMainGuiOpen = function(val)
 		Main.MainGuiOpen = val
 
-		Main.MainGui.OpenButton.Text = val and "Close" or "Dex++"
+		Main.MainGui.OpenButton.Text = val and "Close" or "dex+-"
 		if val then Main.MainGui.OpenButton.MainFrame.Visible = true end
 		Main.MainGui.OpenButton.MainFrame:TweenSize(val and UDim2.new(0,224,0,200) or UDim2.new(0,0,0,0),Enum.EasingDirection.Out,Enum.EasingStyle.Quad,0.2,true)
 		--Main.MainGui.OpenButton.BackgroundTransparency = val and 0 or (Lib.CheckMouseInGui(Main.MainGui.OpenButton) and 0 or 0.2)
@@ -15609,7 +16014,7 @@ Main = (function()
 	Main.CreateMainGui = function()
 		local gui = create({
 			{1,"ScreenGui",{IgnoreGuiInset=true,Name="MainMenu",}},
-			{2,"TextButton",{AnchorPoint=Vector2.new(0.5,0),AutoButtonColor=false,BackgroundColor3=Color3.new(0.17647059261799,0.17647059261799,0.17647059261799),BorderSizePixel=0,Font=4,Name="OpenButton",Parent={1},Position=UDim2.new(0.5,0,0,2),Size=UDim2.new(0,55,0,32),Text="Dex++",TextColor3=Color3.new(1,1,1),TextSize=16,TextTransparency=0.20000000298023,}},
+			{2,"TextButton",{AnchorPoint=Vector2.new(0.5,0),AutoButtonColor=false,BackgroundColor3=Color3.new(0.17647059261799,0.17647059261799,0.17647059261799),BorderSizePixel=0,Font=4,Name="OpenButton",Parent={1},Position=UDim2.new(0.5,0,0,2),Size=UDim2.new(0,55,0,32),Text="dex+-",TextColor3=Color3.new(1,1,1),TextSize=16,TextTransparency=0.20000000298023,}},
 			{3,"UICorner",{CornerRadius=UDim.new(0,4),Parent={2},}},
 			{4,"Frame",{AnchorPoint=Vector2.new(0.5,0),BackgroundColor3=Color3.new(0.17647059261799,0.17647059261799,0.17647059261799),ClipsDescendants=true,Name="MainFrame",Parent={2},Position=UDim2.new(0.5,0,1,-4),Size=UDim2.new(0,224,0,200),}},
 			{5,"UICorner",{CornerRadius=UDim.new(0,4),Parent={4},}},
@@ -15734,6 +16139,7 @@ Main = (function()
 		Main.CreateApp({Name = "Save Instance", IconMap = Main.LargeIcons, Icon = "Book", Window = SaveInstance.Window})
 		
 		Main.CreateApp({Name = "3D Viewer", IconMap = Main.LargeIcons, Icon = "Object", Window = ModelViewer.Window})
+		Main.CreateApp({Name = "Favorites & History", IconMap = Main.LargeIcons, Icon = "Book", Window = Apps.Extras.Window})
 
 		--Main.CreateApp({Name = "Secret Service Panel", IconMap = Main.LargeIcons, Icon = "Output", Window = SecretServicePanel.Window})
 		
@@ -15868,6 +16274,7 @@ Main = (function()
 		SaveInstance.Init()
 		ModelViewer.Init()
 		SettingsWindow.Init()
+		Apps.Extras.Init()
 		--SecretServicePanel.Init()
 		
 		
@@ -15936,3 +16343,4 @@ end)()
 Main.Init()
 
 --for i,v in pairs(Main.MissingEnv) do print(i,v) end
+
