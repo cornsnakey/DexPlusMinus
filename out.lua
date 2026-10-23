@@ -3664,7 +3664,9 @@ local function main()
 	Extras.State = state
 	local Explorer, window, list, status, back, forward, favorite, tabs, clear
 	local activeTab, navigating, busy = "Favorites", false, false
+	local tabAnimations = {}
 	local theme = deps.Settings.Theme
+	local transparency = deps.Settings.Window and deps.Settings.Window.Transparency or 0.2
 
 	local function getNode(obj)
 		local node = nodes[obj]
@@ -3695,8 +3697,9 @@ local function main()
 		local success, path = pcall(function() return obj:GetFullName() end)
 		return success and path or nameOf(obj)
 	end
-	local function button(parent, text, position, size, callback)
-		local item = Instance.new("TextButton")
+	local function button(parent, text, position, size, callback, isEntry)
+		local control = not isEntry and deps.Lib.Button and deps.Lib.Button.new()
+		local item = control and control.Gui or Instance.new("TextButton")
 		item.Name = text
 		item.Text = text
 		item.RichText = false
@@ -3704,19 +3707,28 @@ local function main()
 		item.TextSize = 14
 		item.TextColor3 = theme.Text
 		item.BackgroundColor3 = theme.Button
+		item.BackgroundTransparency = isEntry and 1 or 0
+		item.AutoButtonColor = false
+		item.BorderSizePixel = isEntry and 0 or 1
 		item.BorderColor3 = theme.Outline2
 		item.Position = position
 		item.Size = size
 		item.Parent = parent
+		local animation = control and control.Anim
+		if not isEntry and not control and deps.Lib.ButtonAnim then
+			animation = deps.Lib.ButtonAnim(item, {Mode = 2, StartColor = theme.Button, HoverColor = theme.ButtonHover, PressColor = theme.ButtonPress})
+		end
 		item.Activated:Connect(callback)
-		return item
+		return item, animation
 	end
 	local function updateButtons()
 		back.TextColor3 = state.Cursor > 1 and theme.Text or theme.PlaceholderText
 		forward.TextColor3 = state.Cursor < #state.History and theme.Text or theme.PlaceholderText
 		favorite.Text = allFavorited(selectedObjects()) and "Unfavorite" or "Favorite"
 		for name, tab in pairs(tabs) do
-			tab.BackgroundColor3 = name == activeTab and theme.ListSelection or theme.Button
+			tab.BackgroundColor3 = name == activeTab and (theme.ButtonPress or theme.Button) or theme.Button
+			tab.BackgroundTransparency = 0
+			if tabAnimations[name] then tabAnimations[name].StartColor = tab.BackgroundColor3 end
 		end
 		clear.Text = activeTab == "Favorites" and "Clear favorites" or "Clear history"
 	end
@@ -3750,40 +3762,58 @@ local function main()
 			if #objects > 1 then label = label.." (+"..(#objects - 1)..")" end
 			local container = Instance.new("Frame")
 			container.BackgroundTransparency = 1
-			container.Size = UDim2.new(1, -4, 0, 46)
+			container.Size = UDim2.new(1, -4, 0, 22)
 			container.LayoutOrder = order
 			container.Parent = list
-			local entry = button(container, "", UDim2.new(), UDim2.new(1, activeTab == "Favorites" and -66 or 0, 1, 0), function()
+			local entry = button(container, "", UDim2.new(), UDim2.new(1, activeTab == "Favorites" and -26 or 0, 1, 0), function()
 				if historyIndex then
 					local targets = state:Visit(historyIndex, getNode)
 					if targets then selectObjects(targets, true) else report("These objects are no longer available.", true) end
 				else
 					selectObjects(objects, false)
 				end
-			end)
-			if historyIndex == state.Cursor and activeTab == "History" then entry.BackgroundColor3 = theme.ListSelection end
+				report(pathOf(obj))
+			end, true)
+			if historyIndex == state.Cursor and activeTab == "History" then
+				entry.BackgroundColor3 = theme.ListSelection
+				entry.BackgroundTransparency = 0
+			end
 			local title = Instance.new("TextLabel")
+			local left = 6
+			if Explorer.MiscIcons then
+				local icon = Instance.new("Frame")
+				icon.Name = "Icon"
+				icon.BackgroundTransparency = 1
+				icon.Position = UDim2.new(0, 2, 0, 3)
+				icon.Size = UDim2.new(0, 16, 0, 16)
+				icon.Parent = entry
+				pcall(function() Explorer.MiscIcons:DisplayExplorerIcons(icon, obj.ClassName) end)
+				left = 22
+			end
 			title.BackgroundTransparency = 1
-			title.Size = UDim2.new(1, -12, 0, 22)
-			title.Position = UDim2.new(0, 6, 0, 1)
+			title.Size = UDim2.new(1, -left - 4, 1, 0)
+			title.Position = UDim2.new(0, left, 0, 0)
 			title.TextXAlignment = Enum.TextXAlignment.Left
 			title.TextTruncate = Enum.TextTruncate.AtEnd
 			title.Font = Enum.Font.SourceSans
-			title.TextSize = 15
+			title.TextSize = 14
 			title.TextColor3 = theme.Text
 			title.Text = label
 			title.Parent = entry
-			local path = title:Clone()
-			path.Position = UDim2.new(0, 6, 0, 23)
-			path.TextSize = 12
-			path.TextColor3 = theme.PlaceholderText
-			path.Text = pathOf(obj)
-			path.Parent = entry
 			if activeTab == "Favorites" then
-				button(container, "Remove", UDim2.new(1, -62, 0, 0), UDim2.new(0, 62, 1, 0), function()
+				local remove = button(container, "Remove", UDim2.new(1, -22, 0, 1), UDim2.new(0, 20, 0, 20), function()
 					state:RemoveFavorite(obj)
 					Extras.Render()
 				end)
+				if Explorer.MiscIcons then
+					remove.Text = ""
+					local icon = Instance.new("ImageLabel")
+					icon.BackgroundTransparency = 1
+					icon.Position = UDim2.new(0, 2, 0, 2)
+					icon.Size = UDim2.new(0, 16, 0, 16)
+					icon.Parent = remove
+					Explorer.MiscIcons:DisplayByKey(icon, "RemoveStar")
+				end
 			end
 		end
 		if activeTab == "Favorites" then
@@ -3848,11 +3878,11 @@ local function main()
 		local objects = selectedObjects()
 		local convertible = false
 		for _, obj in ipairs(objects) do if deps.Features.canConvert(obj) then convertible = true break end end
-		context:Add({Name = allFavorited(objects) and "Remove from Favorites" or "Add to Favorites", Disabled = #objects == 0, OnClick = Extras.ToggleFavorites})
-		context:Add({Name = "Favorites & History", OnClick = function() Extras.Show() end})
-		context:Add({Name = "History Back", Disabled = state.Cursor <= 1, OnClick = function() Extras.Navigate(-1) end})
-		context:Add({Name = "History Forward", Disabled = state.Cursor >= #state.History, OnClick = function() Extras.Navigate(1) end})
-		context:Add({Name = "Create Tool (Local)", Disabled = not convertible, OnClick = Extras.CreateTools})
+		context:Add({Name = allFavorited(objects) and "Remove from Favorites" or "Add to Favorites", IconMap = Explorer.MiscIcons, Icon = allFavorited(objects) and "RemoveStar" or "AddStar", Disabled = #objects == 0, OnClick = Extras.ToggleFavorites})
+		context:Add({Name = "Favorites & History", IconMap = Explorer.MiscIcons, Icon = "ExploreData", OnClick = function() Extras.Show() end})
+		context:Add({Name = "History Back", IconMap = Explorer.MiscIcons, Icon = "Undo", Disabled = state.Cursor <= 1, OnClick = function() Extras.Navigate(-1) end})
+		context:Add({Name = "History Forward", IconMap = Explorer.MiscIcons, Icon = "Redo", Disabled = state.Cursor >= #state.History, OnClick = function() Extras.Navigate(1) end})
+		context:Add({Name = "Create Tool (Local)", IconMap = Explorer.ClassIcons, Icon = "Tool", Disabled = not convertible, OnClick = Extras.CreateTools})
 	end
 
 	Extras.Init = function()
@@ -3862,24 +3892,28 @@ local function main()
 		window:Resize(440, 380)
 		Extras.Window = window
 		local content = window.GuiElems.Content
-		back = button(content, "Back", UDim2.new(0, 5, 0, 5), UDim2.new(0.18, -5, 0, 28), function() Extras.Navigate(-1) end)
-		forward = button(content, "Forward", UDim2.new(0.18, 2, 0, 5), UDim2.new(0.2, -5, 0, 28), function() Extras.Navigate(1) end)
-		favorite = button(content, "Favorite", UDim2.new(0.38, 0, 0, 5), UDim2.new(0.27, -4, 0, 28), Extras.ToggleFavorites)
-		button(content, "Create Tool", UDim2.new(0.65, 0, 0, 5), UDim2.new(0.35, -5, 0, 28), Extras.CreateTools)
+		content.BackgroundTransparency = transparency
+		back = button(content, "Back", UDim2.new(0, 5, 0, 3), UDim2.new(0.18, -5, 0, 20), function() Extras.Navigate(-1) end)
+		forward = button(content, "Forward", UDim2.new(0.18, 2, 0, 3), UDim2.new(0.2, -5, 0, 20), function() Extras.Navigate(1) end)
+		favorite = button(content, "Favorite", UDim2.new(0.38, 0, 0, 3), UDim2.new(0.27, -4, 0, 20), Extras.ToggleFavorites)
+		button(content, "Create Tool", UDim2.new(0.65, 0, 0, 3), UDim2.new(0.35, -5, 0, 20), Extras.CreateTools)
 		tabs = {}
 		for i, tab in ipairs({"Favorites", "History"}) do
-			tabs[tab] = button(content, tab, UDim2.new((i - 1) * 0.5, 5, 0, 38), UDim2.new(0.5, -8, 0, 28), function()
+			local tabButton, animation = button(content, tab, UDim2.new((i - 1) * 0.5, 5, 0, 27), UDim2.new(0.5, -8, 0, 20), function()
 				activeTab = tab
 				list.CanvasPosition = Vector2.new()
 				Extras.Render()
 			end)
+			tabs[tab], tabAnimations[tab] = tabButton, animation
 		end
 		list = Instance.new("ScrollingFrame")
 		list.Name = "Entries"
 		list.BackgroundColor3 = theme.Main2
+		list.BackgroundTransparency = 1
+		list.BorderSizePixel = 0
 		list.BorderColor3 = theme.Outline1
-		list.Position = UDim2.new(0, 5, 0, 72)
-		list.Size = UDim2.new(1, -10, 1, -112)
+		list.Position = UDim2.new(0, 5, 0, 51)
+		list.Size = UDim2.new(1, -10, 1, -79)
 		list.CanvasSize = UDim2.new()
 		list.AutomaticCanvasSize = Enum.AutomaticSize.Y
 		list.ScrollBarThickness = 6
@@ -3887,16 +3921,16 @@ local function main()
 		list.Parent = content
 		local layout = Instance.new("UIListLayout")
 		layout.SortOrder = Enum.SortOrder.LayoutOrder
-		layout.Padding = UDim.new(0, 4)
+		layout.Padding = UDim.new(0, 0)
 		layout.Parent = list
-		clear = button(content, "Clear favorites", UDim2.new(0, 5, 1, -34), UDim2.new(0, 105, 0, 28), function()
+		clear = button(content, "Clear favorites", UDim2.new(0, 5, 1, -24), UDim2.new(0, 105, 0, 20), function()
 			if activeTab == "Favorites" then state:ClearFavorites() else state:ClearHistory() end
 			Extras.Render()
 		end)
 		status = Instance.new("TextLabel")
 		status.BackgroundTransparency = 1
-		status.Position = UDim2.new(0, 118, 1, -36)
-		status.Size = UDim2.new(1, -123, 0, 32)
+		status.Position = UDim2.new(0, 118, 1, -26)
+		status.Size = UDim2.new(1, -123, 0, 24)
 		status.Font = Enum.Font.SourceSans
 		status.TextSize = 12
 		status.TextWrapped = true
