@@ -50,6 +50,31 @@ local DexUtil = (function()
 -- Pure helpers, also executable in ordinary Lua for regression tests.
 local Util = {}
 
+-- Walk parents before children; GetDescendants ordering is not required.
+function Util.populateTree(root, rootNode, nodeMap, getChildren)
+	local pending = {{Obj = root, Node = rootNode}}
+	local count, failures = 0, 0
+	while #pending > 0 do
+		local current = table.remove(pending)
+		local ok, children = pcall(getChildren, current.Obj)
+		if ok and type(children) == "table" then
+			for _, child in ipairs(children) do
+				if not nodeMap[child] then
+					local node = {Obj = child, Parent = current.Node}
+					nodeMap[child] = node
+					current.Node[#current.Node + 1] = node
+					current.Node.Sorted = nil
+					pending[#pending + 1] = {Obj = child, Node = node}
+					count = count + 1
+				end
+			end
+		else
+			failures = failures + 1
+		end
+	end
+	return count, failures
+end
+
 function Util.escapeRichText(text)
 	return (tostring(text):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;"))
 end
@@ -939,7 +964,7 @@ local function main()
 	local tree,listEntries,explorerOrders,searchResults,specResults = {},{},{},{},{}
 	local expanded
 	local entryTemplate,treeFrame,toolBar,descendantAddedCon,descendantRemovingCon,itemChangedCon
-	local ffa = game.FindFirstAncestorWhichIsA
+	local function ffa(obj) return obj.Parent end
 	local getDescendants = game.GetDescendants
 	local getTextSize = service.TextService.GetTextSize
 	local updateDebounce,refreshDebounce = false,false
@@ -3462,6 +3487,8 @@ return search]==]
 
 		-- Fill in nodes
 		nodes[game] = {Obj = game}
+		-- Parent properties may return the original DataModel reference.
+		nodes[workspace.Parent] = nodes[game]
 		expanded[nodes[game]] = true
 
 		-- Nil Instances
@@ -3471,32 +3498,13 @@ return search]==]
 
 		Explorer.SetupConnections()
 
-		local insts = getDescendants(game)
-		if Main.Elevated then
-			for i = 1,#insts do
-				local obj = insts[i]
-				local par = nodes[ffa(obj,"Instance")]
-				if not par then continue end
-				local newNode = {
-					Obj = obj,
-					Parent = par,
-				}
-				nodes[obj] = newNode
-				par[#par+1] = newNode
-			end
-		else
-			for i = 1,#insts do
-				local obj = insts[i]
-				local s,parObj = pcall(ffa,obj,"Instance")
-				local par = nodes[parObj]
-				if not par then continue end
-				local newNode = {
-					Obj = obj,
-					Parent = par,
-				}
-				nodes[obj] = newNode
-				par[#par+1] = newNode
-			end
+		local count, failures = Main.GetInitDeps().Util.populateTree(game, nodes[game], nodes, function(obj)
+			return obj:GetChildren()
+		end)
+		if count == 0 then
+			warn("Dex++ Explorer could not read the game tree. Child enumeration returned no accessible instances.")
+		elseif failures > 0 then
+			warn("Dex++ Explorer skipped "..failures.." unreadable branches.")
 		end
 	end
 
